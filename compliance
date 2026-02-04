@@ -1,0 +1,416 @@
+from datetime import date
+import pandas as pd
+from viki import Viki
+from compliance_check_data import ComplianceCheckData
+import duckdb
+from rule_engine import Rule
+import os
+from dotenv import load_dotenv
+
+
+class ComplianceCheckEngine(Viki):
+    def __init__(self, viki: Viki):
+        self.ref_date = None
+        self.viki = viki
+        self.db = viki.dbase
+        self.book_overview = None
+        self.nav = None
+        self.calc_book_overview = None
+        self.trades = None
+        self.info_di = None
+        self.du_di_dap = None
+        self.taxa_di_dap = None
+        self.df_dii_dif_quebrado = None
+        self.index = None
+        self.dv01 = None
+        self.nav = None
+
+
+    def build(self, ref_date: date,config,query):
+        self.ref_date = ref_date
+
+        compliance_check = ComplianceCheckData()
+        compliance_check.ref_date = self.ref_date
+
+        self.df_book_overview(self.ref_date)
+        self.df_calc_book_overview(self.ref_date)
+        self.df_info_di()
+        self.df_trades(self.ref_date)
+        metric = self.fixar_metricas(config)
+        df_overview, df_check = self.checar_regras(metric,config)
+
+        if query != '':
+            df_overview = duckdb.from_query(query).to_df()
+            compliance_check.compliance_check_data = df_overview
+            return compliance_check
+
+        compliance_check.compliance_check_data = df_check
+
+        return compliance_check
+
+
+    def df_book_overview(self, ref_date: date):
+        query = '''
+            select * from calc_book_overview cbo
+            left join parameters_product p on p.ProductCLass = cbo.product_Class and p.Product = cbo.product 
+            left join parameters_productClass pc on pc.productClass = p.ProductCLass
+            left join parameters_fundsCalculatedNAV n on n.valDate = cbo.valDate and n.fund = cbo.tradingDesk
+
+            where cbo.valdate = ?   
+        '''
+        tabela_over = self.db.db.dataframe_query_parameter(query, (ref_date))
+        nav_dict = tabela_over.set_index('tradingDesk')['NAV'].to_dict()
+        self.book_overview = tabela_over
+        self.nav = nav_dict
+
+
+    def df_info_di(self):
+        ref_date = self.viki.cal.get_actual_workday(self.ref_date,-1)
+        query = '''
+            select TckrSymb as Product,XprtnDT as expiryDate ,AdjstdQtTax as Taxa from b3.SettlementPrice 
+            where RptDt = ? and (TckrSymb like 'DI1%' or TckrSymb like 'DAP%')
+        '''
+        tabela_info = self.db.db.dataframe_query_parameter(query, (ref_date))
+
+        tabela_info['DU'] = tabela_info['expiryDate'].apply(
+            lambda x: self.viki.cal.num_of_workdays(self.ref_date, x)
+        )
+
+        self.du_di_dap= tabela_info.set_index('Product')['DU'].to_dict()
+        self.taxa_di_dap = tabela_info.set_index('Product')['Taxa'].to_dict()
+        self.info_di = tabela_info
+
+
+    def df_calc_book_overview(self, ref_date: date):
+        valdate = self.viki.cal.get_actual_workday(ref_date, -1)
+        query ='''
+            select * from calc_book_overview
+            where valDate = ?
+        '''
+        tabela_calc = self.db.db.dataframe_query_parameter(query, (valdate))
+        self.calc_book_overview = tabela_calc
+
+
+    def df_trades(self, ref_date: date):
+        lote45_filename = os.getenv('TRADE_TRACKER_LOTE45_TRADE_FILE').replace('{date}', ref_date.strftime('%Y%m%d'))
+        lote45_filename = f'{os.getenv("TRADE_TRACKER_LOCAL_DIR")}\\{lote45_filename}'
+        lote45_filename = os.path.join(lote45_filename)
+        trades = pd.read_csv(lote45_filename, sep='\t', dayfirst=False, low_memory=False)
+        trades = trades[~(trades['ProductClass'] == 'Provisions and Costs')]
+        trades = trades[~trades['Trading Desk'].str.startswith(('Allocation'), na=False)].reset_index(drop=True)
+        self.trades = trades
+
+
+    def fixar_metricas(self,config):
+        self.index = (pd.Index(self.book_overview['tradingDesk']).union(self.trades['Trading Desk']).unique().to_frame(name='tradingDesk'))
+
+        funcoes = (
+            self.fund_prev,
+            self.fund_inst,
+            self.exp_acoes,
+            self.day_trade,
+            self.alavancagem,
+        )
+
+        db = pd.concat((func() for func in funcoes), axis=1)
+
+        return db
+
+
+    def checar_regras(self, df, config):
+        df_check = pd.DataFrame({
+                "Verificação": "VALIDO",
+                "Regra Violada": "" },
+                index=df.index)
+
+        regras_compiladas = {
+            fundo: [(regra["nome"], Rule(regra["regra"])) for regra in regras] for fundo, regras in config["fundos"].items() if regras
+        }
+
+        for fundo, regras in regras_compiladas.items():
+            if fundo not in df.index:
+                continue
+
+            facts = df.loc[fundo].to_dict()
+
+            for nome_regra, rule in regras:
+                if not rule.matches(facts):
+                    df_check.loc[fundo] = ["INVALIDO", nome_regra]
+                    break
+
+        df_out = (df.reset_index().rename(columns={"index": "tradingDesk"})
+                .merge(df_check,left_on="tradingDesk",right_index=True,how="left")
+                .sort_values("tradingDesk")
+                .reset_index(drop=True))
+
+
+        return df_out, df_check
+
+
+    def fund_prev(self):
+        df_prev = self.index
+        df_prev['fund_prev'] = df_prev['tradingDesk'].str.contains('PREV').map({True:'S', False:'N'})
+        df_prev = df_prev.set_index('tradingDesk')
+
+        return df_prev
+
+
+    def fund_inst(self):
+        df_inst = self.index
+        df_inst['fund_inst'] = df_inst['tradingDesk'].str.contains('INST').map({True:'S', False:'N'})
+        df_inst = df_inst.set_index('tradingDesk')
+
+        return df_inst
+
+
+    def exp_acoes(self):
+        colunas = ['tradingDesk', 'product_Class', 'position']
+        exp_over = self.calc_book_overview[colunas].copy()
+        exp_over = exp_over[exp_over['product_Class'].isin(['Equity', 'US Equity'])].reset_index(drop=True)
+        exp_over['NAV'] = exp_over['tradingDesk'].map(self.nav)
+
+        colunas_trades = ['Trading Desk', 'ProductClass','Amount','Price']
+        exp_trades = self.trades[colunas_trades].copy()
+        exp_trades['position'] = exp_trades['Amount'] * exp_trades['Price']
+        exp_trades = exp_trades.rename(columns={'Trading Desk':'tradingDesk', 'ProductClass':'product_Class'}).drop(columns=['Amount','Price'])
+        exp_trades = exp_trades[exp_trades['product_Class'].isin(['Equity', 'US Equity'])]
+        exp_trades['NAV'] = exp_trades['tradingDesk'].map(self.nav)
+
+        df_exp = pd.concat([exp_over, exp_trades],ignore_index=True)
+
+        df_exp[['position','NAV']] = df_exp[['position','NAV']].astype(float)
+
+        df_exp = df_exp.groupby("tradingDesk").agg({
+            "position": "sum",
+            "NAV": "first"
+        })
+
+        df_exp['exp_acoes'] = ((df_exp['position'] / df_exp['NAV']) * 100).fillna(0)
+        df_exp = df_exp[['exp_acoes']].round(2)
+        df_exp = df_exp.reindex(self.index['tradingDesk']).fillna(0)
+
+        return df_exp
+
+
+    def day_trade(self):
+        df_trades_hj = self.trades[['Trading Desk', 'Product', 'Amount']].copy()
+
+        prod = df_trades_hj['Product']
+        filtro_dii_dif = prod.str.startswith(('DII', 'DIF'), na=False)
+        filtro_di1 = prod.str.startswith('DI1', na=False)
+
+        df_trades_hj.loc[filtro_di1, 'Amount'] *= -1
+
+        if filtro_dii_dif.any():
+            df_trades_dii_dif = df_trades_hj[filtro_dii_dif].reset_index(drop=True)
+            dv01 = self.dv01_di()
+            df_quebra = self.quebra_dii_dif(df_trades_dii_dif, self.dv01)
+
+            df_trades_hj = df_trades_hj[~filtro_dii_dif].reset_index(drop=True)
+            df_trades_hj= pd.concat([df_trades_hj,df_quebra], ignore_index=True)
+
+        group = df_trades_hj.groupby(["Trading Desk", "Product"])["Amount"]
+
+        df_day_trade = (group.apply(lambda x: (x > 0).any() & (x < 0).any())
+                        .rename("day_trade")
+                        .reset_index()
+        )
+
+        df_day_trade = (df_day_trade.groupby('Trading Desk')['day_trade'].any()
+                        .map({True: 'S', False: 'N'})
+                        .reindex(self.index['tradingDesk'], fill_value='N')
+                        .to_frame()
+        )
+
+        return df_day_trade
+
+
+    def dv01_di(self):
+        dv01_di = self.info_di
+
+        dv01_di['Taxa'] = dv01_di['Taxa'].astype(float)
+        dv01_di['Taxa'] = (dv01_di['Taxa'] / 100)
+        dv01_di['Taxa + 1bp'] = dv01_di['Taxa'] + 1 / 10000
+
+        dv01_di['DU'] = dv01_di['Product'].map(self.du_di_dap)
+
+        dv01_di['Preço'] = 100000 / ((1 + dv01_di['Taxa']) ** (dv01_di['DU'] / 252))
+        dv01_di['Preço + 1bp'] = 100000 / ((1 + dv01_di['Taxa + 1bp']) ** (dv01_di['DU'] / 252))
+
+        dv01_di['dv01_diff'] = dv01_di['Preço'] - dv01_di['Preço + 1bp']
+
+        dv01_di['DV01 Derivada'] = ((10000 / ((1 + dv01_di['Taxa']) ** ((dv01_di['DU'] - 1) / 252))) * (
+                (dv01_di['DU'] - 1) / 252)) / (1 + dv01_di['Taxa'])
+
+        dict_dv01 = dv01_di.set_index('Product')['DV01 Derivada'].to_dict()
+        self.dv01 = dict_dv01
+
+
+    def quebra_dii_dif(self, df_trades_hj, dict_dv01):
+        resultados = []
+
+        for produto, func in {
+            'DII': self.quebra_dii,
+            'DIF': self.quebra_dif
+        }.items():
+
+            filtro = df_trades_hj['Product'].str.startswith(produto, na=False)
+            quebra = df_trades_hj.loc[filtro].copy()
+
+            if quebra.empty:
+                continue
+
+            index = quebra['Product'].str.replace(produto, '', regex=False)
+
+            quebra['DI Curto'] = 'DI1' + index.str[:3]
+            quebra['DI Longo'] = 'DI1' + index.str[3:]
+            quebra['Amount'] *= -1
+
+            di_quebrado = func(quebra, dict_dv01)
+
+            df_curto = di_quebrado[['Trading Desk', 'DI Curto', 'Amount Curto']] \
+                .rename(columns={'DI Curto': 'Product', 'Amount Curto': 'Amount'})
+
+            df_longo = di_quebrado[['Trading Desk', 'DI Longo', 'Amount']] \
+                .rename(columns={'DI Longo': 'Product'})
+
+            resultados.append(pd.concat([df_curto, df_longo], ignore_index=True))
+
+        self.df_dii_dif_quebrado = pd.concat(resultados, ignore_index=True)
+        return self.df_dii_dif_quebrado
+
+
+    def quebra_dii(self,trades_dii,dict_dv01):
+
+        trades_dii['Amount Curto'] = 0.0
+        trades_dii['DV01 Curto'] = trades_dii['DI Curto'].map(dict_dv01)
+        trades_dii['DV01 Longo'] = trades_dii['DI Longo'].map(dict_dv01)
+        trades_dii['Ratio'] = trades_dii['DV01 Longo'] / trades_dii['DV01 Curto']
+        trades_dii['Amount Curto'] = trades_dii['Amount'] * trades_dii['Ratio'] * -1
+        trades_dii['Amount Curto'] = trades_dii['Amount Curto'].round(0)
+
+        return trades_dii
+
+
+    def quebra_dif(self,trades_dif,dict_dv01):
+
+        trades_dif['Amount Curto'] = 0.0
+        trades_dif['Vencimento Curto'] = trades_dif['DI Curto'].map(dict_taxa)
+        trades_dif['Vencimento Longo'] = trades_dif['DI Longo'].map(dict_taxa)
+
+        trades_dif['DU Curto'] = trades_dif['DI Curto'].map(dict_vencimento)
+        trades_dif['DU Longo'] = trades_dif['DI Longo'].map(dict_vencimento)
+
+        for prazo in ['Curto', 'Longo']:
+            trades_dif[f'DU {prazo}'] = trades_dif[f'DU {prazo}'].apply(
+                lambda x: self.viki.cal.num_of_workdays(self.ref_date, x)
+            )
+
+        trades_dif['Ratio'] = (100000 / (1 + trades_dif['Vencimento Longo']) ** (trades_dif['DU Longo'] / 252)) / (
+                    100000 / (1 + trades_dif['Vencimento Curto']) ** (trades_dif['DU Curto'] / 252))
+
+        trades_dif['Amount Curto'] = trades_dif['Amount'] * trades_dif['Ratio'] * -1
+        trades_dif['Amount Curto'] =  trades_dif['Amount Curto'].round(0)
+
+        return trades_dif
+
+
+    def alavancagem(self):
+        lista_alavancagem = []
+        price_di_dap = self.book_overview.loc[self.book_overview['product'].str.startswith(('DI1','DAP'), na=False)].set_index('product')['price'].to_dict()
+
+        for produto in ['DI1', 'DAP']:
+            df_produto = self.calc_book_overview.loc[self.calc_book_overview['product'].str.startswith(produto, na=False) ].copy()
+
+            if df_produto.empty:
+                lista_alavancagem.append(pd.DataFrame())
+                continue
+
+            df_produto['DU'] = df_produto['product'].map(self.du_di_dap)
+
+            df_produto = df_produto[['tradingDesk', 'product','DU', 'amount']]
+
+            df_produto[['DU', 'amount']] = df_produto[['DU', 'amount']].apply(pd.to_numeric, errors='coerce')
+
+            df_produto = df_produto.groupby(['tradingDesk', 'product'], as_index=False).agg(
+                {'DU': 'first' ,'amount': 'sum'})
+
+            if self.trades['Product'].str.startswith((produto), na=False).any():
+                df_produto = self.get_di_dap_trades(df_produto,produto,price_di_dap)
+
+            else:
+                df_produto['price'] = df_produto['product'].map(price_di_dap)
+                cols = ['tradingDesk', 'product', 'price', 'DU', 'amount']
+                df_produto = df_produto[cols]
+
+            df_produto['NAV'] = df_produto['tradingDesk'].map(self.nav)
+
+            colunas = ['price','NAV']
+            df_produto[colunas] = df_produto[colunas].apply(pd.to_numeric, errors='coerce')
+
+            if produto == 'DI1':
+                lista_alavancagem.append(self.alavancagem_di(df_produto))
+            else:
+                lista_alavancagem.append (self.alavancagem_dap(df_produto))
+
+
+        df_alavancagem = pd.concat(lista_alavancagem, ignore_index=True)
+        df_alavancagem = df_alavancagem.groupby("tradingDesk").agg({'% Do Fundo': 'sum'}).rename(
+            columns={'% Do Fundo': 'alavancagem'}).round(2)
+        df_alavancagem = df_alavancagem.reindex(self.index['tradingDesk']).fillna(0)
+
+        return df_alavancagem
+
+
+    def alavancagem_di(self, df_produto):
+        if self.trades['Product'].str.startswith(('DII', 'DIF'), na=False).any():
+            dif_dii_quebra = self.df_dii_dif_quebrado
+            df_info = df_produto[['tradingDesk','product','price', 'DU', 'NAV']]
+            dif_dii_quebra = dif_dii_quebra.merge(df_info,on=['tradingDesk','product'],how='left')
+            dif_dii_quebra = dif_dii_quebra[['tradingDesk', 'product', 'price', 'DU', 'amount', 'NAV']]
+            df_produto = pd.concat([dif_dii_quebra, df_produto]).reset_index(drop=True)
+
+        df_produto['PU'] = 100000 / ((1 + df_produto['price']) ** (df_produto['DU'] / 252))
+        df_produto['notinal'] = df_produto['PU'] * df_produto['amount']
+        df_produto['% Do Fundo'] = (df_produto['notinal'] / df_produto['NAV']) * 100
+        df_alavancagem_di = df_produto.groupby('tradingDesk', as_index=False).agg({'% Do Fundo': 'sum'})
+        df_alavancagem_di['% Do Fundo'] = df_alavancagem_di['% Do Fundo'].abs()
+
+        return df_alavancagem_di
+
+
+    def alavancagem_dap(self, df_produto):
+        ipca = self.db.index_value('IPCAPRT', self.viki.cal.get_actual_workday(self.ref_date, -1))
+
+        df_produto['PU'] = (100000 * 0.00025 * ipca) / ((1 + df_produto['price']) ** (df_produto['DU'] / 252))
+        df_produto['notinal'] = df_produto['PU'] * df_produto['amount']
+        df_produto['% Do Fundo'] = (df_produto['notinal'] / df_produto['NAV']) * 100
+        df_alavancagem_dap = df_produto.groupby('tradingDesk', as_index=False).agg({'% Do Fundo': 'sum'})
+        df_alavancagem_dap['% Do Fundo'] = df_alavancagem_dap['% Do Fundo'].abs()
+
+        return df_alavancagem_dap
+
+
+    def get_di_dap_trades(self, df_produto,produto,dict_price):
+        df_di_trades = self.trades[self.trades['Product'].str.startswith(produto, na=False)].reset_index(drop=True)
+        df_di_trades['Amount'] = df_di_trades['Amount'] * -1
+        df_di_trades = df_di_trades[['Trading Desk', 'Product', 'Amount', 'Price']]
+
+        df_di_trades['DU'] = df_di_trades['Product'].map(self.du_di_dap)
+
+        df_di_trades = df_di_trades.rename(
+            columns={'Trading Desk': 'tradingDesk', 'Product': 'product', 'Amount': 'amount','Price': 'price'})
+
+        df_di_trades['price'] = df_di_trades['price']/100
+
+        df_produto['price'] = df_produto['product'].map(dict_price)
+
+        cols=['tradingDesk','product','price', 'DU', 'amount']
+        df_produto = df_produto[cols]
+        df_di_trades = df_di_trades[cols]
+
+        df_trades_produto = pd.concat([df_di_trades,df_produto]).reset_index(drop=True)
+        df_trades_produto = df_trades_produto.groupby(['tradingDesk','product'], as_index=False).agg({'price': 'first','DU':'first','amount':'sum'})
+
+        return df_trades_produto
+
